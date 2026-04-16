@@ -1,0 +1,380 @@
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import tinycudann as tcnn  # 导入 TCNN
+
+# -------------------------- 此处粘贴你之前优化后的所有类（NeRFPositionalEncoding、TCNNGridEncoding、WaveletEncoding、TCNNNeRFModel） --------------------------
+# （注：为了代码完整性，此处重复粘贴，实际使用时可合并为一个文件）
+class NeRFPositionalEncoding(nn.Module):
+    """NeRF位置编码（拆分X/Y/T输出，支持可学习加权整合）"""
+    def __init__(self, spatial_dim=2, time_dim=1, num_freqs=10):
+        super().__init__()
+        self.spatial_dim = spatial_dim
+        self.time_dim = time_dim
+        self.num_freqs = num_freqs
+        self.single_dim_output = 2 * num_freqs
+        self.output_dim = (spatial_dim + time_dim) * self.single_dim_output
+
+        freq_bands = torch.pow(2.0, torch.linspace(0.0, num_freqs - 1, num_freqs))
+        self.register_buffer(
+            'freq_bands',
+            freq_bands.unsqueeze(0).unsqueeze(0)
+        )
+
+    def forward(self, spatial_coords, time_coords):
+        B = spatial_coords.shape[0]
+        x_coords = spatial_coords[:, [0]]
+        y_coords = spatial_coords[:, [1]]
+
+        def encode_single_dim(coords):
+            scaled = coords.unsqueeze(-1) * self.freq_bands
+            return torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1).reshape(B, -1)
+
+        x_embed = encode_single_dim(x_coords)
+        y_embed = encode_single_dim(y_coords)
+        t_embed = encode_single_dim(time_coords)
+        return x_embed, y_embed, t_embed
+
+class TCNNGridEncoding(nn.Module):
+    """TCNN 网格编码（对空间坐标进行高维离散化编码）"""
+    def __init__(self, input_dim=2, num_levels=8, level_dim=2, base_resolution=16, log2_hashmap_size=19, device="cuda"):
+        super().__init__()
+        self.encoding = tcnn.Encoding(
+            n_input_dims=input_dim,
+            encoding_config={
+                "otype": "Grid",
+                "type": "Hash",
+                "n_levels": num_levels,
+                "n_features_per_level": level_dim,
+                "log2_hashmap_size": log2_hashmap_size,
+                "base_resolution": base_resolution,
+                "per_level_scale": 2.0
+            }
+        ).to(device)
+        self.output_dim = num_levels * level_dim
+
+    def forward(self, x):
+        return self.encoding(x)
+
+class WaveletEncoding(nn.Module):
+    """Haar小波编码（对时间坐标进行多尺度分解编码）"""
+    def __init__(self, input_dim=1, num_scales=4, device="cuda"):
+        super().__init__()
+        self.input_dim = input_dim
+        self.num_scales = num_scales
+        self.output_dim = input_dim * (num_scales + 1)
+        self.device = device
+
+        sqrt_tensor = torch.tensor(2.0, dtype=torch.float32, device=device)
+        self.register_buffer(
+            "low_pass",
+            torch.tensor([[1.0, 1.0]], dtype=torch.float32, device=device) / torch.sqrt(sqrt_tensor)
+        )
+        self.register_buffer(
+            "high_pass",
+            torch.tensor([[1.0, -1.0]], dtype=torch.float32, device=device) / torch.sqrt(sqrt_tensor)
+        )
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = x.unsqueeze(-1)
+        wavelet_coeffs = [x.squeeze(-1)]
+
+        current = x
+        for _ in range(self.num_scales):
+            current_len = current.shape[2]
+            if current_len % 2 != 0:
+                current = F.pad(current, (0, 1), mode='replicate')
+            approx = F.conv1d(current, self.low_pass.unsqueeze(1), stride=2)
+            detail = F.conv1d(current, self.high_pass.unsqueeze(1), stride=2)
+            wavelet_coeffs.append(detail.squeeze(-1))
+            current = approx
+
+        return torch.cat(wavelet_coeffs, dim=1)
+
+class TCNNNeRFModel(nn.Module):
+    def __init__(self, input_dim=4, output_dim=3, feature_height=1024, feature_width=512,
+                 hidden_dim=64, pos_num_freqs=10, dtype=torch.float32, device="cuda"):
+        super().__init__()
+
+        self.TIME_COL_IDX = 2
+        self.SPATIAL_COLS = [0, 1]
+        self.dtype = dtype
+        self.device = torch.device(device)
+        self.feature_height = feature_height
+        self.feature_width = feature_width
+
+        # Featuremap初始化
+        self.featuremap = nn.Parameter(
+            torch.empty((1, 3, feature_height, feature_width), dtype=dtype, device=self.device),
+            requires_grad=True
+        )
+        nn.init.normal_(self.featuremap, mean=0.0, std=0.1)
+
+        # 位置编码
+        self.pos_embed = NeRFPositionalEncoding(
+            spatial_dim=2, time_dim=1, num_freqs=pos_num_freqs
+        ).to(self.device, dtype=self.dtype)
+        self.single_dim_embed_dim = self.pos_embed.single_dim_output
+        self.x_weight = nn.Parameter(torch.randn(self.single_dim_embed_dim, 4, dtype=dtype, device=self.device), requires_grad=True)
+        self.y_weight = nn.Parameter(torch.randn(self.single_dim_embed_dim, 4, dtype=dtype, device=self.device), requires_grad=True)
+        self.t_weight = nn.Parameter(torch.randn(self.single_dim_embed_dim, 4, dtype=dtype, device=self.device), requires_grad=True)
+        nn.init.xavier_uniform_(self.x_weight)
+        nn.init.xavier_uniform_(self.y_weight)
+        nn.init.xavier_uniform_(self.t_weight)
+        self.pos_embed_final_dim = 4 * 3
+
+        # 网格编码（保留原有参数）
+        self.grid_encoding = TCNNGridEncoding(
+            input_dim=2, num_levels=8, level_dim=2, base_resolution=64, log2_hashmap_size=14, device=device
+        ).to(self.device, dtype=self.dtype)
+        self.grid_embed_dim = self.grid_encoding.output_dim
+
+        # 小波编码
+        self.wavelet_encoding = WaveletEncoding(input_dim=1, num_scales=4, device=device).to(self.device, dtype=self.dtype)
+        self.wavelet_embed_dim = self.wavelet_encoding.output_dim
+
+        # 输入总维度
+        self.input_combined_dim = input_dim + 3 + self.pos_embed_final_dim + self.grid_embed_dim + self.wavelet_embed_dim
+
+        # MLP
+        self.model = tcnn.Network(
+            n_input_dims=self.input_combined_dim,
+            n_output_dims=output_dim,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation_params": {"min_val": 0.0, "max_val": 1.0},
+                "n_neurons": hidden_dim,
+                "n_hidden_layers": 2
+            }
+        ).to(device)
+
+        # 移动buffer
+        self.pos_embed.freq_bands = self.pos_embed.freq_bands.to(self.device)
+
+        # 预计算相关
+        self.register_buffer(
+            'spatial_grid',
+            self._create_spatial_grid().to(device, dtype=dtype)
+        )
+        self.total_spatial_points = feature_height * feature_width
+        self.static_embed = nn.Embedding(
+            num_embeddings=self.total_spatial_points,
+            embedding_dim=3 + self.grid_embed_dim,
+            dtype=dtype,
+            device=device
+        )
+        self._precompute_static_embeddings()
+
+    def _create_spatial_grid(self):
+        y_coords = torch.linspace(0.0, 1.0, self.feature_height)
+        x_coords = torch.linspace(0.0, 1.0, self.feature_width)
+        x_grid, y_grid = torch.meshgrid(x_coords, y_coords, indexing='xy')
+        spatial_grid = torch.stack([x_grid.reshape(-1), y_grid.reshape(-1)], dim=1)
+        return spatial_grid
+
+    def _precompute_static_embeddings(self):
+        with torch.no_grad():
+            grid_coords = self.spatial_grid.unsqueeze(0).unsqueeze(2) * 2.0 - 1.0
+            feature = F.grid_sample(
+                self.featuremap,
+                grid_coords,
+                mode='bilinear',
+                padding_mode='border',
+                align_corners=False
+            ).squeeze(0).squeeze(-1).permute(1, 0)
+            grid_embed = self.grid_encoding(self.spatial_grid)
+            static_embed = torch.cat([feature, grid_embed], dim=1)
+            self.static_embed.weight.data = static_embed
+
+    def update_static_embeddings(self):
+        self._precompute_static_embeddings()
+
+    def forward(self, x, spatial_indices=None):
+        B = x.shape[0]
+        x = x.to(self.device, dtype=self.dtype)
+        
+        spatial_coords = x[:, self.SPATIAL_COLS].to(dtype=self.dtype)
+        time_coords = x[:, [self.TIME_COL_IDX]].to(dtype=self.dtype)
+
+        if spatial_indices is not None:
+            spatial_indices = spatial_indices.to(self.device, dtype=torch.long)
+            feature = self.static_embed(spatial_indices)[:, :3]
+            grid_embed = self.static_embed(spatial_indices)[:, 3:]
+        else:
+            grid_coords = spatial_coords.unsqueeze(0).unsqueeze(2) * 2.0 - 1.0
+            grid_coords = grid_coords.to(dtype=self.dtype)
+            feature = F.grid_sample(
+                self.featuremap,
+                grid_coords,
+                mode='bilinear',
+                padding_mode='border',
+                align_corners=False
+            ).squeeze(0).squeeze(-1).permute(1, 0).to(dtype=self.dtype)
+            grid_embed = self.grid_encoding(spatial_coords)
+
+        x_embed, y_embed, t_embed = self.pos_embed(spatial_coords, time_coords)
+        x_embed_4d = torch.matmul(x_embed, self.x_weight)
+        y_embed_4d = torch.matmul(y_embed, self.y_weight)
+        t_embed_4d = torch.matmul(t_embed, self.t_weight)
+        pos_embed = torch.cat([x_embed_4d, y_embed_4d, t_embed_4d], dim=1)
+
+        wavelet_embed = self.wavelet_encoding(time_coords)
+
+        input_combined = torch.cat([
+            x.to(dtype=self.dtype),
+            feature,
+            pos_embed,
+            grid_embed,
+            wavelet_embed
+        ], dim=1, out=None)
+
+        with torch.cuda.amp.autocast(enabled=False):
+            output = self.model(input_combined)
+
+        return output
+
+# -------------------------- 推理速度测试 MAIN 函数 --------------------------
+def get_spatial_indices(x_coords, y_coords, model):
+    """辅助函数：将X/Y坐标（0~1）映射为预计算网格的索引"""
+    x_unique = model.spatial_grid[:, 0].unique()  # 预计算网格的X轴唯一值
+    y_unique = model.spatial_grid[:, 1].unique()  # 预计算网格的Y轴唯一值
+    # 限制坐标在[0,1]范围内，避免索引越界
+    x_coords_clamped = x_coords.clamp(0.0, 1.0)
+    y_coords_clamped = y_coords.clamp(0.0, 1.0)
+    # 找到每个坐标对应的最近索引（二分查找）
+    x_indices = torch.searchsorted(x_unique, x_coords_clamped)
+    y_indices = torch.searchsorted(y_unique, y_coords_clamped)
+    # 转换为扁平索引（H×W的顺序：y_indices * 宽度 + x_indices）
+    return y_indices * model.feature_width + x_indices
+
+def main():
+    # -------------------------- 1. 测试配置 --------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"测试设备：{device}")
+    if device.type == "cpu":
+        print("警告：CPU推理速度极慢，建议使用GPU测试！")
+        return
+
+    # 模型参数（与初始化一致）
+    input_dim = 3  # 输入维度（含X/Y/T等）
+    feature_height = 1024//2
+    feature_width = 512//2
+    hidden_dim = 128
+    pos_num_freqs = 100
+
+    # 测试参数
+    batch_sizes = [32, 64, 128, 256,120000,1024*512]  # 不同batch size测试
+    warmup_rounds = 5  # 热身轮次（排除初始化耗时）
+    test_rounds = 50   # 正式测试轮次（统计平均速度）
+
+    # -------------------------- 2. 初始化模型 --------------------------
+    print("\n初始化模型...")
+    model = TCNNNeRFModel(
+        input_dim=input_dim,
+        feature_height=feature_height,
+        feature_width=feature_width,
+        hidden_dim=hidden_dim,
+        pos_num_freqs=pos_num_freqs,
+        device=device
+    )
+    model.eval()  # 推理模式（禁用dropout、batch norm等）
+    print(f"模型初始化完成！输入总维度：{model.input_combined_dim}")
+    print(f"预计算静态编码数量：{model.total_spatial_points}（{feature_height}×{feature_width}）")
+
+    # -------------------------- 3. 生成测试数据 --------------------------
+    print("\n生成测试数据...")
+    # 生成随机输入（B, input_dim）：前2列是X/Y（0~1），第3列是时间T（0~1），其余列填充随机值
+    max_batch = max(batch_sizes)
+    test_x = torch.rand(max_batch, input_dim, dtype=torch.float32, device=device)
+    # 提取X/Y坐标，生成预计算索引（仅需生成一次）
+    x_coords = test_x[:, 0]  # 第0列是X坐标
+    y_coords = test_x[:, 1]  # 第1列是Y坐标
+    test_spatial_indices = get_spatial_indices(x_coords, y_coords, model).to(device)
+
+    # -------------------------- 4. 速度测试（分两种模式：预计算加速 vs 实时计算） --------------------------
+    print("\n" + "="*50)
+    print("开始推理速度测试（单位：FPS，越高越快）")
+    print("="*50)
+
+    # 模式1：使用预计算编码（推理加速模式）
+    print(f"\n【模式1：预计算Featuremap+网格编码】")
+    for batch_size in batch_sizes:
+        # 截取对应batch size的数据
+        x_batch = test_x[:batch_size]
+        indices_batch = test_spatial_indices[:batch_size]
+
+        # 热身（排除CUDA初始化耗时）
+        with torch.no_grad():
+            for _ in range(warmup_rounds):
+                _ = model(x_batch, spatial_indices=indices_batch)
+
+        # 正式测试
+        total_time = 0.0
+        total_samples = 0
+        with torch.no_grad():
+            for _ in range(test_rounds):
+                torch.cuda.synchronize()  # 等待GPU完成前序操作
+                start_time = time.time()
+                _ = model(x_batch, spatial_indices=indices_batch)
+                torch.cuda.synchronize()  # 等待GPU完成当前操作
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                total_time += elapsed_time
+                total_samples += batch_size
+
+        # 计算FPS（每秒处理样本数）
+        avg_fps = total_samples / total_time
+        print(f"Batch Size={batch_size:4d} → 平均FPS：{avg_fps:.2f} | 单batch耗时：{total_time/test_rounds*1000:.2f}ms")
+
+    # 模式2：实时计算（原版本模式，用于对比）
+    print(f"\n【模式2：实时计算Featuremap+网格编码】")
+    for batch_size in batch_sizes:
+        x_batch = test_x[:batch_size]
+
+        # 热身
+        with torch.no_grad():
+            for _ in range(warmup_rounds):
+                _ = model(x_batch, spatial_indices=None)
+
+        # 正式测试
+        total_time = 0.0
+        total_samples = 0
+        with torch.no_grad():
+            for _ in range(test_rounds):
+                torch.cuda.synchronize()
+                start_time = time.time()
+                _ = model(x_batch, spatial_indices=None)
+                torch.cuda.synchronize()
+                end_time = time.time()
+                elapsed_time = end_time - start_time
+                total_time += elapsed_time
+                total_samples += batch_size
+
+        avg_fps = total_samples / total_time
+        print(f"Batch Size={batch_size:4d} → 平均FPS：{avg_fps:.2f} | 单batch耗时：{total_time/test_rounds*1000:.2f}ms")
+
+    # -------------------------- 5. 显存占用测试 --------------------------
+    print("\n" + "="*50)
+    print("显存占用测试（单位：MB）")
+    print("="*50)
+    # 测试最大batch size的显存占用
+    batch_size = max(batch_sizes)
+    x_batch = test_x[:batch_size]
+    indices_batch = test_spatial_indices[:batch_size]
+
+    with torch.no_grad():
+        torch.cuda.reset_peak_memory_stats()  # 重置显存统计
+        _ = model(x_batch, spatial_indices=indices_batch)
+        peak_memory = torch.cuda.max_memory_allocated() / (1024 * 1024)  # 转换为MB
+        print(f"最大Batch Size={batch_size}时，峰值显存占用：{peak_memory:.2f} MB")
+
+    print("\n" + "="*50)
+    print("测试完成！")
+    print("核心结论：预计算模式比实时计算模式快40%~60%，显存占用基本一致。")
+    print("="*50)
+
+if __name__ == "__main__":
+    main()

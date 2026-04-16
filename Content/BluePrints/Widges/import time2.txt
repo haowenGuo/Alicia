@@ -1,0 +1,228 @@
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import tinycudann as tcnn  # 导入 TCNN
+
+# 🔴 保持修改后的位置编码类（拆分X/Y/T，支持可学习加权）
+class NeRFPositionalEncoding(nn.Module):
+    """NeRF位置编码（拆分X/Y/T输出，支持可学习加权整合）"""
+    def __init__(self, spatial_dim=2, time_dim=1, num_freqs=10):
+        super().__init__()
+        self.spatial_dim = spatial_dim
+        self.time_dim = time_dim
+        self.num_freqs = num_freqs
+        self.single_dim_output = 2 * num_freqs  # 单个维度的编码输出（sin+cos）
+        self.output_dim = (spatial_dim + time_dim) * self.single_dim_output
+
+        freq_bands = torch.pow(2.0, torch.linspace(0.0, num_freqs - 1, num_freqs))
+        self.register_buffer(
+            'freq_bands',
+            freq_bands.unsqueeze(0).unsqueeze(0)
+        )
+
+        self.spatial_embed_dim = spatial_dim * self.single_dim_output
+        self.time_embed_dim = time_dim * self.single_dim_output
+
+    def forward(self, spatial_coords, time_coords):
+        B = spatial_coords.shape[0]
+        x_coords = spatial_coords[:, [0]]  # (B, 1)
+        y_coords = spatial_coords[:, [1]]  # (B, 1)
+
+        def encode_single_dim(coords):
+            scaled = coords.unsqueeze(-1) * self.freq_bands  # (B, 1, num_freqs)
+            return torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-1).reshape(B, -1)
+
+        x_embed = encode_single_dim(x_coords)  # (B, 2*num_freqs)
+        y_embed = encode_single_dim(y_coords)  # (B, 2*num_freqs)
+        t_embed = encode_single_dim(time_coords)  # (B, 2*num_freqs)
+
+        return x_embed, y_embed, t_embed
+
+# 🔴 新增：TCNN 网格编码（Grid Encoding）- 用于空间坐标（X,Y）
+class TCNNGridEncoding(nn.Module):
+    """TCNN 网格编码（对空间坐标进行高维离散化编码）"""
+    def __init__(self, input_dim=2, num_levels=8, level_dim=2, base_resolution=16, log2_hashmap_size=19, device="cuda"):
+        super().__init__()
+        self.encoding = tcnn.Encoding(
+            n_input_dims=input_dim,
+            encoding_config={
+                "otype": "Grid",          # 网格编码类型
+                "type": "Hash",           # 哈希网格（内存高效）
+                "n_levels": num_levels,   # 网格层级数
+                "n_features_per_level": level_dim,  # 每层特征维度
+                "log2_hashmap_size": log2_hashmap_size,  # 哈希表大小（2^19）
+                "base_resolution": base_resolution,  # 基础分辨率
+                "per_level_scale": 2.0    # 每层分辨率缩放因子
+            }
+        ).to(device)
+        self.output_dim = num_levels * level_dim  # 输出维度 = 层级数 × 每层维度
+
+    def forward(self, x):
+        return self.encoding(x)  # (B, 2) → (B, output_dim)
+
+# 🔴 修复：小波编码（Haar小波）- 修正torch.sqrt()的输入类型
+class WaveletEncoding(nn.Module):
+    """Haar小波编码（对时间坐标进行多尺度分解编码）"""
+    def __init__(self, input_dim=1, num_scales=4, device="cuda"):
+        super().__init__()
+        self.input_dim = input_dim
+        self.num_scales = num_scales  # 小波分解尺度数
+        self.output_dim = input_dim * (num_scales + 1)  # 输出维度 = 尺度数+1（近似+细节）
+        self.device = device
+
+        # 🔴 修复：将2.0转换成张量，并移到指定设备
+        sqrt_tensor = torch.tensor(2.0, dtype=torch.float32, device=device)
+        # 预计算Haar小波滤波器（低通+高通）
+        self.register_buffer(
+            "low_pass",
+            torch.tensor([[1.0, 1.0]], dtype=torch.float32, device=device) / torch.sqrt(sqrt_tensor)  # (1, 2)
+        )
+        self.register_buffer(
+            "high_pass",
+            torch.tensor([[1.0, -1.0]], dtype=torch.float32, device=device) / torch.sqrt(sqrt_tensor)  # (1, 2)
+        )
+
+    def forward(self, x):
+        # x: (B, 1) → 时间坐标（归一化到[0,1]）
+        B = x.shape[0]
+        x = x.unsqueeze(-1)  # (B, 1, 1)
+
+        # 初始化小波系数（存储近似系数和各尺度细节系数）
+        wavelet_coeffs = [x.squeeze(-1)]  # 初始近似系数：(B, 1)
+
+        # 多尺度小波分解
+        current = x
+        for _ in range(self.num_scales):
+            # 补零到偶数长度（小波分解要求）
+            current_len = current.shape[2]
+            if current_len % 2 != 0:
+                current = F.pad(current, (0, 1), mode='replicate')  # (B, 1, L) → (B, 1, L+1)
+
+            # 卷积实现小波分解（低通=近似，高通=细节）
+            approx = F.conv1d(current, self.low_pass.unsqueeze(1), stride=2)  # (B, 1, L/2)
+            detail = F.conv1d(current, self.high_pass.unsqueeze(1), stride=2)  # (B, 1, L/2)
+
+            # 存储细节系数，更新当前近似系数
+            wavelet_coeffs.append(detail.squeeze(-1))  # (B, 1)
+            current = approx
+
+        # 拼接所有系数 → (B, num_scales+1)
+        wavelet_embed = torch.cat(wavelet_coeffs, dim=1)  # (B, output_dim)
+        return wavelet_embed
+
+class TCNNNeRFModel(nn.Module):
+    def __init__(self, input_dim=4, output_dim=3, feature_height=1024, feature_width=512,
+                 hidden_dim=64, pos_num_freqs=10, dtype=torch.float32, device="cuda"):
+        super().__init__()
+
+        self.TIME_COL_IDX = 2
+        self.SPATIAL_COLS = [0, 1]
+        self.dtype = dtype
+        self.device = torch.device(device)
+
+        # Featuremap：保持原有初始化
+        self.featuremap = nn.Parameter(
+            torch.empty((1, 3, feature_width, feature_height), dtype=dtype, device=self.device),
+            requires_grad=True
+        )
+        nn.init.normal_(self.featuremap, mean=0.0, std=0.1)
+
+        # 1. 原有：可学习加权位置编码（X/Y/T → 12维）
+        self.pos_embed = NeRFPositionalEncoding(
+            spatial_dim=2,
+            time_dim=1,
+            num_freqs=pos_num_freqs
+        ).to(self.device, dtype=self.dtype)
+        self.single_dim_embed_dim = self.pos_embed.single_dim_output
+        # 位置编码加权参数
+        self.x_weight = nn.Parameter(torch.randn(self.single_dim_embed_dim, 4, dtype=dtype, device=self.device), requires_grad=True)
+        self.y_weight = nn.Parameter(torch.randn(self.single_dim_embed_dim, 4, dtype=dtype, device=self.device), requires_grad=True)
+        self.t_weight = nn.Parameter(torch.randn(self.single_dim_embed_dim, 4, dtype=dtype, device=self.device), requires_grad=True)
+        nn.init.xavier_uniform_(self.x_weight)
+        nn.init.xavier_uniform_(self.y_weight)
+        nn.init.xavier_uniform_(self.t_weight)
+        self.pos_embed_final_dim = 4 * 3  # 12维
+
+        # 2. 新增：TCNN网格编码（空间坐标X/Y → 高维特征）
+        self.grid_encoding = TCNNGridEncoding(
+            input_dim=2,
+            num_levels=8,    # 可调整：层级越多，特征越细
+            level_dim=4,      # 可调整：每层特征维度
+            base_resolution=64,
+            log2_hashmap_size=14,
+            device=device
+        ).to(self.device, dtype=self.dtype)
+        self.grid_embed_dim = self.grid_encoding.output_dim  # 16×2=32维
+
+        # 3. 新增：小波编码（时间坐标T → 多尺度特征）
+        self.wavelet_encoding = WaveletEncoding(
+            input_dim=1,
+            num_scales=4,     # 可调整：尺度越多，时间细节越丰富
+            device=device
+        ).to(self.device, dtype=self.dtype)
+        self.wavelet_embed_dim = self.wavelet_encoding.output_dim  # 4+1=5维
+
+        # 🔴 更新输入总维度：原有逻辑 + 位置编码 + 网格编码 + 小波编码
+        self.input_combined_dim = input_dim + 3 + self.pos_embed_final_dim + self.grid_embed_dim + self.wavelet_embed_dim
+
+        # TCNN MLP：输入维度更新为融合后的总维度
+        self.model = tcnn.Network(
+            n_input_dims=self.input_combined_dim,
+            n_output_dims=output_dim,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation_params": {"min_val": 0.0, "max_val": 1.0},
+                "n_neurons": hidden_dim,
+                "n_hidden_layers": 2
+            }
+        ).to(device)
+
+        # 移动所有编码的buffer到设备
+        self.pos_embed.freq_bands = self.pos_embed.freq_bands.to(self.device)
+
+    def forward(self, x):
+        B = x.shape[0]
+        x = x.to(self.device, dtype=self.dtype)
+        
+        spatial_coords = x[:, self.SPATIAL_COLS].to(dtype=self.dtype)  # (B, 2)：X,Y
+        time_coords = x[:, [self.TIME_COL_IDX]].to(dtype=self.dtype)   # (B, 1)：T
+
+        # 1. Featuremap采样：保持原有逻辑
+        grid_coords = spatial_coords.unsqueeze(0).unsqueeze(2) * 2.0 - 1.0  # 归一化到[-1,1]
+        grid_coords = grid_coords.to(dtype=self.dtype)
+        feature = F.grid_sample(
+            self.featuremap,
+            grid_coords,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=False
+        ).squeeze(0).squeeze(-1).permute(1, 0).to(dtype=self.dtype)  # (B, 3)
+
+        # 2. 原有：可学习加权位置编码（X/Y/T → 12维）
+        x_embed, y_embed, t_embed = self.pos_embed(spatial_coords, time_coords)
+        x_embed_4d = torch.matmul(x_embed, self.x_weight)  # (B,4)
+        y_embed_4d = torch.matmul(y_embed, self.y_weight)  # (B,4)
+        t_embed_4d = torch.matmul(t_embed, self.t_weight)  # (B,4)
+        pos_embed = torch.cat([x_embed_4d, y_embed_4d, t_embed_4d], dim=1)  # (B,12)
+
+        # 3. 新增：TCNN网格编码（空间X/Y → 高维特征）
+        grid_embed = self.grid_encoding(spatial_coords)  # (B, 32)（示例维度）
+
+        # 4. 新增：小波编码（时间T → 多尺度特征）
+        wavelet_embed = self.wavelet_encoding(time_coords)  # (B,5)（示例维度）
+
+        # 🔴 融合所有编码：原始坐标 + featuremap + 位置编码 + 网格编码 + 小波编码
+        input_combined = torch.cat([
+            x.to(dtype=self.dtype),          # 原始输入：(B, input_dim)
+            feature,                         # featuremap采样：(B,3)
+            pos_embed,                       # 位置编码：(B,12)
+            grid_embed,                      # 网格编码：(B,32)
+            wavelet_embed                    # 小波编码：(B,5)
+        ], dim=1, out=None)  # 总维度 = input_dim +3 +12 +32 +5
+
+        with torch.cuda.amp.autocast(enabled=False):
+            output = self.model(input_combined)
+
+        return output

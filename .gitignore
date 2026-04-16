@@ -1,41 +1,50 @@
-# Prerequisites
-*.d
+# Unreal Engine generated files
+.vs/
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+Plugins/*/Binaries/
+Plugins/*/Intermediate/
+Build/**/FileOpenOrder/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# Visual Studio and IDE noise
+*.VC.db
+*.VC.opendb
+*.sln.docstates
+*.suo
+*.user
+*.userprefs
+*.opensdf
+*.opendb
 
-# Precompiled Headers
-*.gch
-*.pch
+# Logs and temp files
+*.log
+*.tmp
+*.dmp
 
-# Linker files
-*.ilk
+# Large third-party or generated content not suitable for this GitHub backup
+Content/Resources/
+Content/Dungeon/
+Content/STF/
+Content/StarterContent/
+Content/Characters/
+Content/BloodPack/
+Content/A001_ForestSounds/
+Content/SwordTrailVFX/
+Content/Fab/
+Content/NPR_Base/
+Content/StylizedEnvironment/
+Content/Stylized_PBR_Nature/
+Content/__ExternalActors__/
+Content/__ExternalObjects__/
+Content/Collections/
+Content/Developers/
+Content/Maps/**
+!Content/Maps/OpenMenu.umap
+!Content/Maps/OpenMenu_BuiltData.uasset
 
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# debug information files
-*.dwo
+# Loose reference images in the repo root
+/50_Stylized_Icons.png
+/StylizedEnvironment.png
+/SylizedProvencal.png
